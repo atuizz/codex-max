@@ -2333,6 +2333,9 @@ async function pressCancelCodexResponse() {
 async function pasteAndEnter(text, target = 'frontmost', attachments = [], threadId = '', options = {}) {
   if (process.platform === 'win32' && target === 'codex') {
     return platform.runExclusive(async () => {
+      if (!options.assumeThreadSynced && isCodexThreadId(threadId)) {
+        await activateCodexThread(threadId, { allowCached: false });
+      }
       for (const attachment of attachments) {
         await copyImageToClipboard(attachment);
         await pressPaste();

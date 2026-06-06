@@ -4911,7 +4911,7 @@
             threadId: selectedThreadId,
             previousThreadId: pendingNewThread?.previousThreadId || '',
             expectedCwd: pendingNewThread?.cwd || pendingNewThread?.projectPath || '',
-            assumeThreadSynced: true,
+            assumeThreadSynced: Boolean(selectedThreadId && syncedThreadId === selectedThreadId),
             expectNewThread: isPendingNewThreadFirstSend,
             directPasteWithoutClick: isPendingNewThreadFirstSend,
             attachments: attachmentsToSend.map(({ name, type, dataUrl }) => ({ name, type, dataUrl })),
