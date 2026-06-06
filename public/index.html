@@ -461,6 +461,42 @@
       stroke-linejoin: round;
       vector-effect: non-scaling-stroke;
     }
+    .cdp-launch-btn {
+      display: inline-grid;
+      flex: 0 0 auto;
+      width: var(--top-control-size);
+      min-width: var(--top-control-size);
+      height: var(--top-control-size);
+      appearance: none;
+      border: 1px solid rgba(142,240,183,.28);
+      border-radius: 999px;
+      background: rgba(142,240,183,.11);
+      color: var(--ok);
+      place-items: center;
+      padding: 0;
+      cursor: pointer;
+      touch-action: manipulation;
+    }
+    .cdp-launch-btn[hidden] { display: none; }
+    .cdp-launch-btn.is-busy {
+      opacity: .62;
+      cursor: wait;
+    }
+    .cdp-launch-btn:active:not(:disabled) {
+      transform: scale(.94);
+      background: rgba(142,240,183,.16);
+    }
+    .cdp-launch-btn svg {
+      width: 15px;
+      height: 15px;
+      display: block;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      vector-effect: non-scaling-stroke;
+    }
     .top-actions {
       flex: 0 1 min(46vw, 340px);
       width: min(46vw, 340px);
@@ -1592,6 +1628,9 @@
         <button class="keep-awake-btn" id="keep-awake" type="button" title="保持亮屏" aria-label="保持亮屏">
           <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3.4"/><path d="M10 2.4v2M10 15.6v2M2.4 10h2M15.6 10h2M4.6 4.6l1.45 1.45M13.95 13.95l1.45 1.45M15.4 4.6l-1.45 1.45M6.05 13.95L4.6 15.4"/></svg>
         </button>
+        <button class="cdp-launch-btn" id="cdp-launch" type="button" title="启动 CDP 受控 Codex" aria-label="启动 CDP 受控 Codex" hidden>
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5v4"></path><path d="M6.5 4.1A6.2 6.2 0 1 0 13.5 4.1"></path><path d="M7.2 11h5.6"></path><path d="m10 8.2 2.8 2.8-2.8 2.8"></path></svg>
+        </button>
         <button class="reasoning-badge is-unknown" id="reasoning-badge" type="button" title="当前推理模式" aria-label="当前推理模式"><span id="reasoning-text">--</span></button>
         <button class="model-badge is-unknown" id="model-badge" type="button" title="当前模型" aria-label="当前模型"><span id="model-text">--</span></button>
         <button class="route-badge" id="route-badge" type="button" title="当前线路：本地" aria-label="当前线路：本地">
@@ -1677,6 +1716,7 @@
     const threadButton = document.getElementById('thread-button');
     const newThreadButton = document.getElementById('new-thread');
     const keepAwakeButton = document.getElementById('keep-awake');
+    const cdpLaunchButton = document.getElementById('cdp-launch');
     const threadCurrentPin = document.getElementById('thread-current-pin');
     const threadNameEl = document.getElementById('thread-name');
     const threadMenuScrim = document.getElementById('thread-menu-scrim');
@@ -1735,6 +1775,7 @@
     let routeMonitorBusy = false;
     let keepAwakeEnabled = false;
     let keepAwakeBusy = false;
+    let cdpLaunchBusy = false;
     let actionThreadId = '';
     let threadLongPressTimer = null;
     let threadLongPressStart = null;
@@ -1762,6 +1803,7 @@
     let currentModelInfo = null;
     let switchingModel = false;
     let routeBadgeCompact = false;
+    let activeControlMode = 'gui';
     let foregroundDotBusy = false;
     const savedContextDisplayMode = Number(localStorage.getItem(CONTEXT_DISPLAY_MODE_STORAGE_KEY));
     let contextDisplayMode = Number.isInteger(savedContextDisplayMode) && savedContextDisplayMode >= 0 && savedContextDisplayMode <= 2 ? savedContextDisplayMode : 0;
@@ -2318,19 +2360,27 @@
       switchingReasoningMode = true;
       renderReasoningBadge();
       setWorkingDot(true);
-      setNotice('正在通过 Codex GUI 切换推理模式…', 'ok');
+      setNotice('正在通过 Codex CDP 切换推理模式…', 'ok');
       try {
         await ensureRouteForSend();
         const response = await fetchApi('/codex/reasoning-mode', {
           method: 'POST',
           headers: { 'content-type': 'application/json', 'x-mobile-typer-token': token },
-          body: JSON.stringify({ threadId: selectedThreadId, target: requestedTarget }),
+          body: JSON.stringify({
+            threadId: selectedThreadId,
+            target: requestedTarget,
+            assumeThreadSynced: Boolean(selectedThreadId && syncedThreadId === selectedThreadId),
+          }),
           apiTimeoutMs: 45000,
           routeSwitchQuiet: true,
           retryProbeTimeoutMs: 900,
         });
         const data = await response.json().catch(() => ({}));
-        if (!response.ok || !data.ok) throw new Error(data.message || '切换推理模式失败');
+        if (!response.ok || !data.ok) {
+          const detail = data.detail || data.code || '';
+          throw new Error(`${data.message || '切换推理模式失败'}${detail ? `：${detail}` : ''}`);
+        }
+        if (selectedThreadId) syncedThreadId = selectedThreadId;
         if (data.targetReasoningMode) {
           writeReasoningOverride(selectedThreadId, data.targetReasoningMode);
           renderReasoningBadge(data.targetReasoningMode);
@@ -2439,13 +2489,21 @@
         const response = await fetchApi('/codex/model-switch', {
           method: 'POST',
           headers: { 'content-type': 'application/json', 'x-mobile-typer-token': token },
-          body: JSON.stringify({ threadId: selectedThreadId, target: requestedTarget }),
+          body: JSON.stringify({
+            threadId: selectedThreadId,
+            target: requestedTarget,
+            assumeThreadSynced: Boolean(selectedThreadId && syncedThreadId === selectedThreadId),
+          }),
           apiTimeoutMs: 45000,
           routeSwitchQuiet: true,
           retryProbeTimeoutMs: 900,
         });
         const data = await response.json().catch(() => ({}));
-        if (!response.ok || !data.ok) throw new Error(data.message || '切换模型失败');
+        if (!response.ok || !data.ok) {
+          const detail = data.detail || data.code || '';
+          throw new Error(`${data.message || '切换模型失败'}${detail ? `：${detail}` : ''}`);
+        }
+        if (selectedThreadId) syncedThreadId = selectedThreadId;
         if (data.targetModel) {
           writeModelOverride(selectedThreadId, data.targetModel);
           renderModelBadge(data.targetModel);
@@ -2465,7 +2523,7 @@
       updateTitleDotState();
     }
     function routeTextForKind(kind) {
-      return '本地';
+      return activeControlMode === 'cdp' ? 'CDP' : 'GUI';
     }
     function routeIconMarkup(kind) {
       if (kind === 'local') {
@@ -2485,8 +2543,19 @@
       routeBadge.className = `route-badge is-local${routeBadgeCompact ? ' is-compact' : ''}`;
       routeIcon.innerHTML = routeIconMarkup(activeApiKind);
       routeText.textContent = text;
-      routeBadge.title = `当前线路：${text} · 电脑局域网；点击切换显示模式`;
+      routeBadge.title = `当前控制：${text} · ${activeControlMode === 'cdp' ? 'CDP 无感控制' : 'GUI 前台回退'}；点击切换显示模式`;
       routeBadge.setAttribute('aria-label', routeBadge.title);
+      renderCdpLaunchButton();
+    }
+    function renderCdpLaunchButton() {
+      if (!cdpLaunchButton) return;
+      const shouldShow = cdpLaunchBusy || activeControlMode !== 'cdp';
+      cdpLaunchButton.hidden = !shouldShow;
+      cdpLaunchButton.disabled = cdpLaunchBusy;
+      cdpLaunchButton.classList.toggle('is-busy', cdpLaunchBusy);
+      const title = cdpLaunchBusy ? '正在启动 CDP 受控 Codex' : '重启 Codex Desktop 并开启 CDP 控制';
+      cdpLaunchButton.title = title;
+      cdpLaunchButton.setAttribute('aria-label', title);
     }
     function toggleRouteBadgeCompact() {
       routeBadgeCompact = !routeBadgeCompact;
@@ -2551,6 +2620,10 @@
       try {
         const response = await fetchWithTimeout(`${candidate.baseUrl}/codex/health?${params}`, { cache: 'no-store' }, timeoutMs);
         const data = await response.json().catch(() => ({}));
+        if (response.ok && data.ok && data.controlMode) {
+          activeControlMode = data.controlMode === 'cdp' ? 'cdp' : 'gui';
+          updateRouteBadge();
+        }
         return response.ok && data.ok;
       } catch {
         return false;
@@ -2688,6 +2761,35 @@
       } finally {
         keepAwakeBusy = false;
         renderKeepAwakeButton();
+      }
+    }
+    async function launchControlledCodex() {
+      if (cdpLaunchBusy) return;
+      cdpLaunchBusy = true;
+      renderCdpLaunchButton();
+      setNotice('正在重启 Codex 为 CDP 受控版本…', 'ok');
+      try {
+        const response = await fetchApi('/codex/cdp-launch', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-mobile-typer-token': token },
+          body: JSON.stringify({ forceRestart: true }),
+          apiTimeoutMs: 30000,
+          routeSwitchQuiet: true,
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || !data.ok) {
+          const detail = data.code || data.cdp?.message || '';
+          throw new Error(`${data.message || '启动 CDP 受控 Codex 失败'}${detail ? `：${detail}` : ''}`);
+        }
+        activeControlMode = 'cdp';
+        updateRouteBadge();
+        setNotice(data.message || '已启动 CDP 受控 Codex', 'ok');
+        await chooseApiCandidate({ preferLocal: true, quiet: true, probeTimeoutMs: 1800 });
+      } catch (error) {
+        setNotice(error.message || '启动 CDP 受控 Codex 失败', 'error');
+      } finally {
+        cdpLaunchBusy = false;
+        renderCdpLaunchButton();
       }
     }
     async function ensureRouteForSend() {
@@ -4922,6 +5024,7 @@
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok || !data.ok) throw new Error(data.message || '发送失败');
+        if (selectedThreadId) syncedThreadId = selectedThreadId;
         if (queueBehindActiveRun) updateQueuedSend(queuedSendId, 'queued');
         setNotice(options.sentNotice || (queueBehindActiveRun ? '已发送，Codex 会排在当前回复后继续处理' : '已发送'), 'ok');
         serializeMessages();
@@ -5314,6 +5417,13 @@
       closeReasoningMenu();
       closeModelMenu();
       toggleKeepAwake();
+    });
+    cdpLaunchButton.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      closeReasoningMenu();
+      closeModelMenu();
+      launchControlledCodex();
     });
     routeBadge.addEventListener('click', event => {
       event.preventDefault();

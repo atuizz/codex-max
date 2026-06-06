@@ -28,8 +28,19 @@ internal sealed record ServiceSnapshot(
     int? Pid,
     int? ThreadCount,
     string LatestThreadTitle,
+    string ControlMode,
     string LogPreview,
     DateTime LastUpdated
+);
+
+internal sealed record HealthSnapshot(
+    bool Ok,
+    string ControlMode
+);
+
+internal sealed record CdpLaunchSnapshot(
+    bool Ok,
+    string Message
 );
 
 internal sealed class ServiceManager
@@ -92,17 +103,18 @@ internal sealed class ServiceManager
     {
         var config = ReadConfig();
         var state = ResolveState(config);
-        var healthOk = await CheckHealthAsync(config);
-        var (threadCount, latestThreadTitle) = healthOk
+        var health = await GetHealthAsync(config);
+        var (threadCount, latestThreadTitle) = health.Ok
             ? await RefreshThreadsAsync(config)
             : (null, "尚未读取线程");
         return new ServiceSnapshot(
-            healthOk ? ServiceState.Running : state,
-            healthOk,
+            health.Ok ? ServiceState.Running : state,
+            health.Ok,
             config.Port,
             ResolvePid(config),
             threadCount,
             latestThreadTitle,
+            health.ControlMode,
             ReadLogPreview(),
             DateTime.Now
         );
@@ -112,7 +124,10 @@ internal sealed class ServiceManager
     {
         await PrepareIfNeededAsync();
         var config = ReadConfig();
-        if (await CheckHealthAsync(config)) return;
+        var projectDir = ResolveServiceProjectDir();
+        var serviceStamp = ComputeServiceStamp(projectDir);
+        var healthOk = await CheckHealthAsync(config);
+        if (healthOk && !string.IsNullOrWhiteSpace(config.ServiceStamp) && config.ServiceStamp == serviceStamp) return;
 
         var existingPid = FindPortOwnerPid(config.Port);
         if (existingPid > 0)
@@ -126,7 +141,6 @@ internal sealed class ServiceManager
             await Task.Delay(500);
         }
 
-        var projectDir = ResolveServiceProjectDir();
         var serverPath = Path.Combine(projectDir, "server.js");
         if (!File.Exists(serverPath))
         {
@@ -153,6 +167,7 @@ internal sealed class ServiceManager
         _ = Task.Run(() => AppendProcessOutputAsync(process.StandardOutput, stdoutPath));
         _ = Task.Run(() => AppendProcessOutputAsync(process.StandardError, stderrPath));
         config.Pid = process.Id;
+        config.ServiceStamp = serviceStamp;
         WriteConfig(config);
 
         for (var i = 0; i < 24; i++)
@@ -178,6 +193,7 @@ internal sealed class ServiceManager
         }
 
         config.Pid = 0;
+        config.ServiceStamp = "";
         WriteConfig(config);
         await Task.Delay(350);
     }
@@ -187,6 +203,25 @@ internal sealed class ServiceManager
         await StopAsync();
         await Task.Delay(350);
         await StartAsync();
+    }
+
+    public async Task<CdpLaunchSnapshot> LaunchControlledCodexAsync()
+    {
+        var config = ReadConfig();
+        if (!await CheckHealthAsync(config)) await StartAsync();
+        config = ReadConfig();
+        using var launchHttp = new HttpClient { Timeout = TimeSpan.FromSeconds(35) };
+        using var response = await launchHttp.PostAsJsonAsync(
+            $"http://127.0.0.1:{config.Port}/codex/cdp-launch?token={Uri.EscapeDataString(config.Token)}",
+            new { forceRestart = true },
+            JsonOptions
+        );
+        var result = await response.Content.ReadFromJsonAsync<CdpLaunchResponse>(JsonOptions);
+        if (!response.IsSuccessStatusCode || result?.Ok != true)
+        {
+            throw new InvalidOperationException(result?.Message ?? "启动 CDP 受控 Codex 失败。");
+        }
+        return new CdpLaunchSnapshot(true, result.Message ?? "已启动 CDP 受控 Codex");
     }
 
     public async Task OpenWebAsync()
@@ -226,14 +261,21 @@ internal sealed class ServiceManager
 
     private async Task<bool> CheckHealthAsync(LauncherConfig config)
     {
+        return (await GetHealthAsync(config)).Ok;
+    }
+
+    private async Task<HealthSnapshot> GetHealthAsync(LauncherConfig config)
+    {
         try
         {
             using var response = await http.GetAsync($"http://127.0.0.1:{config.Port}/codex/health?token={Uri.EscapeDataString(config.Token)}");
-            return response.IsSuccessStatusCode;
+            if (!response.IsSuccessStatusCode) return new HealthSnapshot(false, "");
+            var health = await response.Content.ReadFromJsonAsync<HealthResponse>(JsonOptions);
+            return new HealthSnapshot(health?.Ok == true, health?.ControlMode ?? "");
         }
         catch
         {
-            return false;
+            return new HealthSnapshot(false, "");
         }
     }
 
@@ -311,6 +353,33 @@ internal sealed class ServiceManager
         return sourceProjectDir;
     }
 
+    private static string ComputeServiceStamp(string projectDir)
+    {
+        try
+        {
+            using var sha = SHA256.Create();
+            foreach (var relativePath in new[] {
+                "server.js",
+                Path.Combine("public", "index.html"),
+                Path.Combine("src", "platform", "win32.js"),
+                Path.Combine("src", "platform", "index.js")
+            })
+            {
+                var file = Path.Combine(projectDir, relativePath);
+                if (!File.Exists(file)) continue;
+                sha.TransformBlock(Encoding.UTF8.GetBytes(relativePath), 0, Encoding.UTF8.GetByteCount(relativePath), null, 0);
+                var bytes = File.ReadAllBytes(file);
+                sha.TransformBlock(bytes, 0, bytes.Length, null, 0);
+            }
+            sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+            return Convert.ToHexString(sha.Hash ?? Array.Empty<byte>());
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
     private string ResolveNodePath()
     {
         if (File.Exists(appDataNodePath)) return appDataNodePath;
@@ -324,23 +393,32 @@ internal sealed class ServiceManager
         throw new InvalidOperationException("没有找到 Node.js。请安装 Node.js 18+，或在 App 资源中内置 node.exe。");
     }
 
-    private void ExtractEmbeddedPayloadIfNeeded()
+    private bool ExtractEmbeddedPayloadIfNeeded()
     {
         var assembly = typeof(ServiceManager).Assembly;
-        using var stream = assembly.GetManifestResourceStream("CodexMaxPayload.zip");
-        if (stream is null) return;
+        var resourceName = assembly.GetManifestResourceNames()
+            .FirstOrDefault(name => name.EndsWith("CodexMaxPayload.zip", StringComparison.OrdinalIgnoreCase));
+        if (string.IsNullOrWhiteSpace(resourceName)) return false;
+        using var stream = assembly.GetManifestResourceStream(resourceName);
+        if (stream is null) return false;
 
         using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
         foreach (var entry in archive.Entries)
         {
             if (string.IsNullOrWhiteSpace(entry.Name)) continue;
             var relative = entry.FullName.Replace('/', Path.DirectorySeparatorChar);
+            if (relative.Equals(Path.Combine("node", "node.exe"), StringComparison.OrdinalIgnoreCase) &&
+                File.Exists(appDataNodePath))
+            {
+                continue;
+            }
             var target = Path.GetFullPath(Path.Combine(appDataDir, relative));
             var appDataRoot = Path.GetFullPath(appDataDir);
             if (!target.StartsWith(appDataRoot, StringComparison.OrdinalIgnoreCase)) continue;
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
             entry.ExtractToFile(target, overwrite: true);
         }
+        return true;
     }
 
     private string ReadLogPreview()
@@ -555,6 +633,7 @@ internal sealed class ServiceManager
         public string Token { get; set; } = "";
         public int Port { get; set; } = DefaultPort;
         public int Pid { get; set; }
+        public string ServiceStamp { get; set; } = "";
     }
 
     private sealed class ThreadSummary
@@ -570,5 +649,23 @@ internal sealed class ServiceManager
 
         [JsonPropertyName("name")]
         public string? Name { get; set; }
+    }
+
+    private sealed class HealthResponse
+    {
+        [JsonPropertyName("ok")]
+        public bool Ok { get; set; }
+
+        [JsonPropertyName("controlMode")]
+        public string? ControlMode { get; set; }
+    }
+
+    private sealed class CdpLaunchResponse
+    {
+        [JsonPropertyName("ok")]
+        public bool Ok { get; set; }
+
+        [JsonPropertyName("message")]
+        public string? Message { get; set; }
     }
 }

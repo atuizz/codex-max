@@ -11,6 +11,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="QRCoder" Version="1.6.0" />
     <EmbeddedResource Include="CodexMaxPayload.zip" LogicalName="CodexMaxPayload.zip" Condition="Exists('CodexMaxPayload.zip')" />
     <Content Include="..\..\server.js" Link="Resources\CodexMaxProject\server.js" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="..\..\package.json" Link="Resources\CodexMaxProject\package.json" CopyToOutputDirectory="PreserveNewest" />

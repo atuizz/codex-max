@@ -66,13 +66,28 @@ iPhone 上打开 Codex Max 网页后，按下面三步操作：
 2. 如果没看到“添加到主屏幕”，先点“查看更多”
 3. 点“添加到主屏幕”，之后从桌面图标打开 Codex Max
 
-> Windows 第一次使用时，Codex Max 会把 Codex Desktop 拉到前台，并短暂接管鼠标、键盘和剪贴板来完成粘贴/回车等操作。请确保当前不是锁屏或 UAC 弹窗状态。
+> Windows 推荐先用 CDP 调试端口启动 Codex Desktop。CDP 可用时，Codex Max 会直接控制 Codex 的渲染页面，无需把 Codex 窗口拉到前台；CDP 不可用或发送图片附件时，会回退到原来的 GUI/剪贴板自动化路径。
 
 ## Windows 源码版 MVP
 
-Windows 版复用原有 HTTP 服务、手机网页、token 鉴权、Codex session/history/status 解析和发送后追踪回复状态的机制，只替换桌面自动化层。它会通过 `codex://threads/<id>` / `codex://threads/new` 切换或新建线程，枚举并激活 Codex Desktop 窗口，优先复用当前输入焦点，必要时再用 UI Automation / 底部相对坐标聚焦输入区，并通过 Windows 剪贴板、SendKeys/SendInput 完成粘贴、回车、取消与快捷键。
+Windows 版复用原有 HTTP 服务、手机网页、token 鉴权、Codex session/history/status 解析和发送后追踪回复状态的机制，只替换桌面自动化层。当前 Windows 控制层优先连接 Codex Desktop 暴露的 Chrome DevTools Protocol（CDP）页面 target，直接在 `app://-/index.html` 渲染层中新建项目线程、聚焦 ProseMirror 输入框、插入文本、点击发送按钮、停止按钮，并通过顶部智能菜单切换推理等级。只有在 CDP 不可用、需要发送图片附件，或执行模型/线程菜单类操作时，才回退到旧的 `codex://` 深链 + UI Automation / 剪贴板 / SendKeys 路径。
+
+开启 Codex Desktop CDP 的调试脚本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-codex-cdp.ps1 -ForceRestart
+```
+
+脚本会用 `--remote-debugging-port=9222` 重启 Codex，并检查 `http://127.0.0.1:9222/json/list` 是否暴露了 `title: Codex`、`url: app://-/index.html` 的 `page` target。本地服务默认连接 `127.0.0.1:9222`；如需换端口，可同时设置：
+
+```powershell
+$env:CODEX_MAX_CDP_PORT = "9333"
+powershell -ExecutionPolicy Bypass -File .\scripts\start-codex-cdp.ps1 -ForceRestart -Port 9333
+```
 
 Windows 客户端工程位于 `windows/CodexMini`，职责对齐 macOS App。当前 Windows 客户端使用 WPF 实现，界面结构复刻 macOS SwiftUI 控制面板：顶部状态、HTTP/端口/线程指标、常用操作、本机入口和日志/启停入口。
+
+客户端面板右侧会显示当前局域网入口二维码，手机扫码即可打开带 token 的控制页。操作区的“受控 Codex”按钮会调用本地服务重启官方 Codex Desktop，并自动附加 `--remote-debugging-port` 参数；手机页在处于 `GUI` 回退模式时也会显示一个小的 CDP 启动按钮。
 
 - 生成并持久化手机访问 token
 - 准备本地服务 payload
@@ -149,9 +164,11 @@ node server.js
 
 Windows 当前限制：
 
-- 会把 Codex Desktop 拉到前台，并短暂接管鼠标、键盘和剪贴板。
-- 不支持锁屏后操作、UAC 弹窗处理、后台无感控制或管理员认证处理。
-- `/send` 串行进入 GUI 队列，会临时写入 Windows 剪贴板完成粘贴；发送期间请避免手动改剪贴板。
+- 纯文本发送、新建项目线程、停止响应和推理模式切换优先走 CDP，可在 Codex 窗口后台完成。
+- 图片附件、模型切换、归档、置顶、重命名等操作暂时仍会回退到 GUI/剪贴板路径。
+- 如果 Codex 不是用 `--remote-debugging-port` 启动，手机端顶部会显示 `GUI`，表示当前处于前台自动化回退模式；显示 `CDP` 时才是无感控制。
+- 不支持锁屏后操作、UAC 弹窗处理或管理员认证处理；这些系统级界面不在 CDP 渲染层内。
+- `/send` 串行进入控制队列。CDP 纯文本发送不使用系统剪贴板；GUI 回退和图片附件仍会临时写入 Windows 剪贴板，发送期间请避免手动改剪贴板。
 - Windows 自动化层会启动一个隐藏的常驻 helper，避免每个 GUI 动作都重新启动 PowerShell；keep-awake 仍使用独立保持亮屏进程。
 - keep-awake 使用 Windows `SetThreadExecutionState`，服务退出或关闭 keep-awake 后会停止保持亮屏。
 

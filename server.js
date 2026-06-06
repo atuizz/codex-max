@@ -40,8 +40,8 @@ const GUI_FAILURE_REPORT_LIMIT = 80;
 const GUI_FAILURE_LOG_SCAN_BYTES = 2 * 1024 * 1024;
 const GUI_FAILURE_LOG_RECENT_MS = 15 * 60 * 1000;
 const RECENT_SEND_TTL_MS = 5 * 60 * 1000;
-const CODEX_THREAD_SYNC_FRESH_MS = 5000;
-const CODEX_DEEPLINK_SETTLE_MS = 560;
+const CODEX_THREAD_SYNC_FRESH_MS = process.platform === 'win32' ? 10 * 60 * 1000 : 5000;
+const CODEX_DEEPLINK_SETTLE_MS = process.platform === 'win32' ? 1400 : 560;
 const CODEX_APP_FOCUS_SETTLE_MS = 100;
 const CODEX_CLICK_SETTLE_MS = 60;
 const TEXT_PASTE_SETTLE_MS = process.platform === 'win32' ? 180 : 140;
@@ -842,7 +842,7 @@ function findCodexSessionFileForNewSend(options = {}) {
   return best && best.file;
 }
 
-async function waitForCodexSessionFileForNewSend(options = {}, timeoutMs = 2600) {
+async function waitForCodexSessionFileForNewSend(options = {}, timeoutMs = 7000) {
   const deadline = Date.now() + timeoutMs;
   let file = null;
   while (Date.now() <= deadline) {
@@ -2333,8 +2333,22 @@ async function pressCancelCodexResponse() {
 async function pasteAndEnter(text, target = 'frontmost', attachments = [], threadId = '', options = {}) {
   if (process.platform === 'win32' && target === 'codex') {
     return platform.runExclusive(async () => {
+      if (!attachments.length) {
+        if (!options.assumeThreadSynced && isCodexThreadId(threadId)) {
+          await activateCodexThread(threadId, { allowCached: false });
+        }
+        if (text) {
+          await pasteTextAndEnter(text);
+          return;
+        }
+        await pressEnter();
+        return;
+      }
+
       if (!options.assumeThreadSynced && isCodexThreadId(threadId)) {
-        await activateCodexThread(threadId, { allowCached: false });
+        await activateCodexThread(threadId, { allowCached: false, preferCdp: false });
+      } else {
+        await focusTarget('codex', threadId, { ...codexFocusOptions(threadId, options), preferCdp: false });
       }
       for (const attachment of attachments) {
         await copyImageToClipboard(attachment);
@@ -2342,7 +2356,8 @@ async function pasteAndEnter(text, target = 'frontmost', attachments = [], threa
         await delay(ATTACHMENT_PASTE_SETTLE_MS);
       }
       if (text) {
-        await pasteTextAndEnter(text);
+        await copyTextToClipboard(text);
+        await pressPasteAndEnter();
         return;
       }
       await pressEnter();
@@ -2381,7 +2396,7 @@ function modelSwitchTargetForCurrent(current = {}, requestedTarget = '') {
   throw error;
 }
 
-async function switchCodexGuiModel(threadId = '', targetKey = '') {
+async function switchCodexGuiModel(threadId = '', targetKey = '', options = {}) {
   if (threadId && !isCodexThreadId(threadId)) {
     const error = new Error('线程 ID 不正确。');
     error.status = 400;
@@ -2395,6 +2410,9 @@ async function switchCodexGuiModel(threadId = '', targetKey = '') {
 
   if (process.platform === 'win32') {
     await platform.runExclusive(async () => {
+      if (!options.assumeThreadSynced && isCodexThreadId(targetThreadId)) {
+        await activateCodexThread(targetThreadId, { allowCached: false });
+      }
       await pasteCodexCommandSelection('/模型', target.displayName, {
         commandSettleMs: CODEX_MODEL_COMMAND_SETTLE_MS,
         selectionSettleMs: CODEX_COMMAND_SETTLE_MS,
@@ -2480,7 +2498,7 @@ async function verifyWindowsToolbarSwitch(kind, target) {
   throw createSwitchVerificationError(kind, target, state);
 }
 
-async function switchCodexReasoningMode(threadId = '', targetKey = '') {
+async function switchCodexReasoningMode(threadId = '', targetKey = '', options = {}) {
   if (threadId && !isCodexThreadId(threadId)) {
     const error = new Error('线程 ID 不正确。');
     error.status = 400;
@@ -2493,7 +2511,36 @@ async function switchCodexReasoningMode(threadId = '', targetKey = '') {
   const target = reasoningModeTargetForCurrent(current, targetKey);
 
   if (process.platform === 'win32') {
+    if (platform.switchReasoningMode) {
+      try {
+        const toolbar = await platform.runExclusive(async () => {
+          if (!options.assumeThreadSynced && isCodexThreadId(targetThreadId)) {
+            await activateCodexThread(targetThreadId, { allowCached: false });
+          }
+          return platform.switchReasoningMode(target.key);
+        });
+        return {
+          ok: true,
+          verified: true,
+          threadId: targetThreadId,
+          currentReasoningMode: current,
+          targetReasoningMode: { ...target, available: true, updatedAt: new Date().toISOString() },
+          toolbar,
+          focusFallback: '',
+          message: `已切换推理模式为 ${target.displayName}`,
+        };
+      } catch (error) {
+        const wrapped = new Error(`CDP 推理模式切换失败：${error.message || '未知错误'}`);
+        wrapped.status = error.code === 'CDP_BAD_REASONING_TARGET' ? 400 : 503;
+        wrapped.code = error.code || 'CDP_REASONING_FAILED';
+        throw wrapped;
+      }
+    }
+
     await platform.runExclusive(async () => {
+      if (!options.assumeThreadSynced && isCodexThreadId(targetThreadId)) {
+        await activateCodexThread(targetThreadId, { allowCached: false });
+      }
       await pasteCodexCommandSelection('/推理模式', target.displayName, {
         commandSettleMs: CODEX_REASONING_COMMAND_SETTLE_MS,
         selectionSettleMs: CODEX_COMMAND_SETTLE_MS,
@@ -2680,8 +2727,9 @@ async function handleModelSwitch(req, res) {
 
   const threadId = typeof payload.threadId === 'string' ? payload.threadId : '';
   const target = typeof payload.target === 'string' ? payload.target : '';
+  const assumeThreadSynced = payload.assumeThreadSynced === true;
   try {
-    const result = await switchCodexGuiModel(threadId, target);
+    const result = await switchCodexGuiModel(threadId, target, { assumeThreadSynced });
     return json(res, 200, result);
   } catch (error) {
     if (error && error.status) {
@@ -2706,8 +2754,9 @@ async function handleReasoningMode(req, res) {
 
   const threadId = typeof payload.threadId === 'string' ? payload.threadId : '';
   const target = typeof payload.target === 'string' ? payload.target : '';
+  const assumeThreadSynced = payload.assumeThreadSynced === true;
   try {
-    const result = await switchCodexReasoningMode(threadId, target);
+    const result = await switchCodexReasoningMode(threadId, target, { assumeThreadSynced });
     return json(res, 200, result);
   } catch (error) {
     if (error && error.status) {
@@ -2811,7 +2860,7 @@ async function handleSend(req, res) {
     }
     const result = {
       ok: true,
-      message: target === 'codex' ? '已切到 Codex，粘贴并按下回车。' : '已粘贴并按下回车。',
+      message: target === 'codex' ? '已发送到 Codex。' : '已粘贴并按下回车。',
       target,
       sentAt: new Date().toISOString(),
       attachments: attachments.map(item => ({ name: item.name, size: item.size, type: item.mime })),
@@ -2888,15 +2937,63 @@ function handleClientConfig(req, res) {
   });
 }
 
-function handleHealth(req, res) {
+async function handleHealth(req, res) {
   if (!isAuthorized(req)) return json(res, 401, { ok: false, code: 'UNAUTHORIZED', message: '访问令牌不正确。' });
+  let cdp = null;
+  if (platform.cdpStatus) {
+    try {
+      cdp = await platform.cdpStatus();
+    } catch (error) {
+      cdp = {
+        available: false,
+        code: error.code || 'CDP_STATUS_FAILED',
+        message: error.message || 'CDP 状态读取失败。',
+      };
+    }
+  }
   return json(res, 200, {
     ok: true,
     service: 'codex-max',
     host: os.hostname(),
     platform: platform.name,
+    controlMode: cdp && cdp.available ? 'cdp' : 'gui',
+    cdp,
     now: new Date().toISOString(),
   });
+}
+
+async function handleCdpLaunch(req, res) {
+  if (!isAuthorized(req)) return json(res, 401, { ok: false, code: 'UNAUTHORIZED', message: '访问令牌不正确。' });
+  if (!platform.launchCodexCdp) {
+    return json(res, 400, {
+      ok: false,
+      code: 'CDP_LAUNCH_UNSUPPORTED',
+      message: '当前平台不支持从 Codex Max 启动 CDP 受控版 Codex。',
+    });
+  }
+
+  let payload = {};
+  try {
+    payload = JSON.parse(await readBody(req) || '{}');
+  } catch (error) {
+    return json(res, 400, { ok: false, code: 'BAD_REQUEST', message: error.message || '请求格式不正确。' });
+  }
+
+  try {
+    const result = await platform.runExclusive(() => platform.launchCodexCdp({
+      forceRestart: payload.forceRestart !== false,
+      waitMs: payload.waitMs,
+    }));
+    return json(res, 200, result);
+  } catch (error) {
+    return json(res, 503, {
+      ok: false,
+      code: error.code || 'CDP_LAUNCH_FAILED',
+      message: error.message || '启动 Codex CDP 受控版本失败。',
+      launch: error.launch,
+      cdp: error.cdp,
+    });
+  }
 }
 
 async function handleKeepAwake(req, res) {
@@ -2946,6 +3043,7 @@ const server = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') return options(res);
   if (req.method === 'GET' && req.url.startsWith('/codex/health')) return handleHealth(req, res);
   if (req.method === 'GET' && req.url.startsWith('/codex/config')) return handleClientConfig(req, res);
+  if (req.method === 'POST' && req.url.startsWith('/codex/cdp-launch')) return handleCdpLaunch(req, res);
   if (req.method === 'POST' && req.url.startsWith('/send')) return handleSend(req, res);
   if (req.method === 'GET' && req.url.startsWith('/codex/threads')) return handleThreads(req, res);
   if (req.method === 'GET' && req.url.startsWith('/codex/history')) return handleThreadHistory(req, res);

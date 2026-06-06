@@ -1,6 +1,9 @@
+using System.IO;
 using System.Windows;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using QRCoder;
 using WpfControl = System.Windows.Controls.Control;
 using WpfMessageBox = System.Windows.MessageBox;
 using WpfColor = System.Windows.Media.Color;
@@ -21,6 +24,7 @@ public partial class MainWindow : Window
         {
             OpenWebButton,
             CopyLinkButton,
+            LaunchCdpButton,
             RestartButton,
             RefreshButton,
             OpenLogsButton,
@@ -62,6 +66,16 @@ public partial class MainWindow : Window
         await RefreshStateAsync();
     }
 
+    private async void LaunchCdp_Click(object sender, RoutedEventArgs e)
+    {
+        await RunActionAsync(async () =>
+        {
+            var result = await service.LaunchControlledCodexAsync();
+            WpfMessageBox.Show(this, result.Message, "Codex Max", MessageBoxButton.OK, MessageBoxImage.Information);
+        });
+        await RefreshStateAsync();
+    }
+
     private async void Refresh_Click(object sender, RoutedEventArgs e)
     {
         await RefreshStateAsync();
@@ -94,8 +108,10 @@ public partial class MainWindow : Window
         StateText.Foreground = statusBrush;
         StateText.Text = StateTextFor(snapshot.State);
         HttpValue.Foreground = snapshot.HealthOk ? good : warn;
-        HttpValue.Text = snapshot.HealthOk ? "正常" : "不可用";
-        HttpFootnote.Text = snapshot.HealthOk ? "HTTP 健康检查正常" : "健康检查不可用";
+        HttpValue.Text = snapshot.HealthOk ? (snapshot.ControlMode == "cdp" ? "CDP" : "GUI") : "不可用";
+        HttpFootnote.Text = snapshot.HealthOk
+            ? (snapshot.ControlMode == "cdp" ? "CDP 无感控制" : "GUI 回退控制")
+            : "健康检查不可用";
         PortValue.Text = snapshot.Port.ToString();
         PortFootnote.Text = "本机入口";
         ThreadValue.Text = snapshot.ThreadCount?.ToString() ?? "-";
@@ -103,7 +119,10 @@ public partial class MainWindow : Window
         InstallPath.Text = service.ShortInstallDirectory;
         UpdatedAt.Text = "更新于 " + snapshot.LastUpdated.ToString("HH:mm:ss");
         EntryKind.Text = "本机入口";
-        EntryUrl.Text = service.PrimaryEntryUrl();
+        var entryUrl = service.PrimaryEntryUrl();
+        EntryUrl.Text = entryUrl;
+        QrUrl.Text = entryUrl;
+        QrImage.Source = QrCodeImage(entryUrl);
         LogPreview.Text = string.IsNullOrWhiteSpace(snapshot.LogPreview)
             ? "暂无最近日志"
             : "最近日志已收起，完整内容可从右侧打开";
@@ -131,6 +150,22 @@ public partial class MainWindow : Window
     {
         Cursor = busy ? System.Windows.Input.Cursors.Wait : null;
         foreach (var control in actionControls) control.IsEnabled = !busy;
+    }
+
+    private static BitmapImage QrCodeImage(string text)
+    {
+        using var generator = new QRCodeGenerator();
+        using var data = generator.CreateQrCode(text, QRCodeGenerator.ECCLevel.M);
+        var png = new PngByteQRCode(data);
+        var bytes = png.GetGraphic(8, [20, 24, 32], [247, 250, 255], true);
+        using var stream = new MemoryStream(bytes);
+        var image = new BitmapImage();
+        image.BeginInit();
+        image.CacheOption = BitmapCacheOption.OnLoad;
+        image.StreamSource = stream;
+        image.EndInit();
+        image.Freeze();
+        return image;
     }
 
     private static string StateTextFor(ServiceState state) => state switch
